@@ -23,6 +23,7 @@
 #include <simde/x86/avx512/andnot.h>
 #include <simde/x86/avx512/blend.h>
 #include <simde/x86/avx512/cmpeq.h>
+#include <simde/x86/avx512/cmpneq.h>
 #include <simde/x86/avx512/loadu.h>
 #include <simde/x86/avx512/lzcnt.h>
 #include <simde/x86/avx512/or.h>
@@ -136,7 +137,11 @@ constexpr inline const HandReference& HandReference::operator=(const std::array<
     return *this;
 }
 
-enum PokerHand : std::int64_t {
+template<typename T>
+concept Int64Enum = std::is_enum_v<T> &&
+                     std::is_same_v<std::underlying_type_t<T>, std::int64_t>;
+
+enum class PokerHandMobileApp : std::int64_t {
     HIGH_CARD = -1,
     PAIR = 0,
     TWO_PAIR = 1,
@@ -148,24 +153,22 @@ enum PokerHand : std::int64_t {
     STRAIGHT_FLUSH = 39,
     ROYAL_FLUSH = 249,
 };
+static_assert(Int64Enum<PokerHandMobileApp>);
 
-const char* hand_name(const PokerHand hand) {
-    switch (hand) {
-        case HIGH_CARD: return "High Card";
-        case PAIR: return "Pair";
-        case TWO_PAIR: return "Two Pair";
-        case THREE_OF_A_KIND: return "Three of a Kind";
-        case STRAIGHT: return "Straight";
-        case FLUSH: return "Flush";
-        case FULL_HOUSE: return "Full House";
-        case FOUR_OF_A_KIND: return "Four of a Kind";
-        case STRAIGHT_FLUSH: return "Straight Flush";
-        case ROYAL_FLUSH: return "Royal Flush";
-        default: std::unreachable();
-    }
-}
+enum class PokerHandJacksOrBetter : std::int64_t {
+    OTHER = -1,
+    JACKS_OR_BETTER = 0,
+    TWO_PAIR = 1,
+    THREE_OF_A_KIND = 2,
+    STRAIGHT = 3,
+    FLUSH = 5,
+    FULL_HOUSE = 8,
+    FOUR_OF_A_KIND = 24,
+    STRAIGHT_FLUSH = 49,
+    ROYAL_FLUSH = 799
+};
 
-// __attribute__((optimize("O3")))
+template<Int64Enum Hand>
 inline __attribute__((always_inline))
 simde__m512i evaluate_hands_avx512(
     // mask of which suits have been seen
@@ -254,28 +257,59 @@ simde__m512i evaluate_hands_avx512(
     // Popcnt == 4 (Pair)
     const simde__mmask8 is_pair = simde_mm512_cmpeq_epi64_mask(v_rank_popcnt, v_four);
 
+    simde__m512i v_result;
+
     // --- 5. Resolve Final Ranks ---
     // Start with HIGH_CARD baseline, layer masks on top to override.
     // Masks are mutually exclusive among non-straight/flush hands.
-    simde__m512i v_result = simde_mm512_set1_epi64(HIGH_CARD);
+    if constexpr (std::same_as<Hand, PokerHandMobileApp>) {
+        using enum PokerHandMobileApp;
+        v_result = simde_mm512_set1_epi64(static_cast<int64_t>(HIGH_CARD));
 
-    v_result = simde_mm512_mask_blend_epi64(is_pair, v_result, simde_mm512_set1_epi64(PAIR));
-    v_result = simde_mm512_mask_blend_epi64(is_2pair, v_result, simde_mm512_set1_epi64(TWO_PAIR));
-    v_result = simde_mm512_mask_blend_epi64(is_3oak, v_result, simde_mm512_set1_epi64(THREE_OF_A_KIND));
-    v_result = simde_mm512_mask_blend_epi64(is_straight, v_result, simde_mm512_set1_epi64(STRAIGHT));
-    v_result = simde_mm512_mask_blend_epi64(is_flush, v_result, simde_mm512_set1_epi64(FLUSH));
-    v_result = simde_mm512_mask_blend_epi64(is_full_house, v_result, simde_mm512_set1_epi64(FULL_HOUSE));
-    v_result = simde_mm512_mask_blend_epi64(is_4oak, v_result, simde_mm512_set1_epi64(FOUR_OF_A_KIND));
+        v_result = simde_mm512_mask_blend_epi64(is_pair, v_result, simde_mm512_set1_epi64(static_cast<int64_t>(PAIR)));
+        v_result = simde_mm512_mask_blend_epi64(is_2pair, v_result, simde_mm512_set1_epi64(static_cast<int64_t>(TWO_PAIR)));
+        v_result = simde_mm512_mask_blend_epi64(is_3oak, v_result, simde_mm512_set1_epi64(static_cast<int64_t>(THREE_OF_A_KIND)));
+        v_result = simde_mm512_mask_blend_epi64(is_straight, v_result, simde_mm512_set1_epi64(static_cast<int64_t>(STRAIGHT)));
+        v_result = simde_mm512_mask_blend_epi64(is_flush, v_result, simde_mm512_set1_epi64(static_cast<int64_t>(FLUSH)));
+        v_result = simde_mm512_mask_blend_epi64(is_full_house, v_result, simde_mm512_set1_epi64(static_cast<int64_t>(FULL_HOUSE)));
+        v_result = simde_mm512_mask_blend_epi64(is_4oak, v_result, simde_mm512_set1_epi64(static_cast<int64_t>(FOUR_OF_A_KIND)));
 
-    // Straight Flush overwrites standalone straight or flush masks
-    v_result = simde_mm512_mask_blend_epi64(is_straight & is_flush, v_result, simde_mm512_set1_epi64(STRAIGHT_FLUSH));
+        // Straight Flush overwrites standalone straight or flush masks
+        v_result = simde_mm512_mask_blend_epi64(is_straight & is_flush, v_result, simde_mm512_set1_epi64(static_cast<int64_t>(STRAIGHT_FLUSH)));
 
-    // Royal Flush overrides Straight Flush
-    v_result = simde_mm512_mask_blend_epi64(is_broadway_straight & is_flush, v_result, simde_mm512_set1_epi64(ROYAL_FLUSH));
+        // Royal Flush overrides Straight Flush
+        v_result = simde_mm512_mask_blend_epi64(is_broadway_straight & is_flush, v_result, simde_mm512_set1_epi64(static_cast<int64_t>(ROYAL_FLUSH)));
+    } else if constexpr (std::same_as<Hand, PokerHandJacksOrBetter>) {
+        using enum PokerHandJacksOrBetter;
+        v_result = simde_mm512_set1_epi64(static_cast<int64_t>(OTHER));
+
+        const simde__m512i v_jacks_or_better = simde_mm512_set1_epi64(0x2'2200'0000'0002); // a count of 2 in any JKQA slot
+        // Need to check if the pair is in JKQA range
+        const simde__m512i is_jack_pair_bits = simde_mm512_and_si512(v_counts, v_jacks_or_better);
+        const simde__mmask8 is_jack_pair_mask = simde_mm512_cmpneq_epi64_mask(is_jack_pair_bits, simde_mm512_setzero_si512());
+
+        v_result = simde_mm512_mask_blend_epi64(is_pair & is_jack_pair_mask, v_result, simde_mm512_set1_epi64(static_cast<int64_t>(JACKS_OR_BETTER)));
+        v_result = simde_mm512_mask_blend_epi64(is_2pair, v_result, simde_mm512_set1_epi64(static_cast<int64_t>(TWO_PAIR)));
+        v_result = simde_mm512_mask_blend_epi64(is_3oak, v_result, simde_mm512_set1_epi64(static_cast<int64_t>(THREE_OF_A_KIND)));
+        v_result = simde_mm512_mask_blend_epi64(is_straight, v_result, simde_mm512_set1_epi64(static_cast<int64_t>(STRAIGHT)));
+        v_result = simde_mm512_mask_blend_epi64(is_flush, v_result, simde_mm512_set1_epi64(static_cast<int64_t>(FLUSH)));
+        v_result = simde_mm512_mask_blend_epi64(is_full_house, v_result, simde_mm512_set1_epi64(static_cast<int64_t>(FULL_HOUSE)));
+        v_result = simde_mm512_mask_blend_epi64(is_4oak, v_result, simde_mm512_set1_epi64(static_cast<int64_t>(FOUR_OF_A_KIND)));
+
+        // Straight Flush overwrites standalone straight or flush masks
+        v_result = simde_mm512_mask_blend_epi64(is_straight & is_flush, v_result, simde_mm512_set1_epi64(static_cast<int64_t>(STRAIGHT_FLUSH)));
+
+        // Royal Flush overrides Straight Flush
+        v_result = simde_mm512_mask_blend_epi64(is_broadway_straight & is_flush, v_result, simde_mm512_set1_epi64(static_cast<int64_t>(ROYAL_FLUSH)));
+    } else {
+        static_assert(Int64Enum<Hand> && false, "these rules are not implemented");
+        std::unreachable();
+    }
 
     return v_result;
 }
 
+template<Int64Enum Hand>
 inline __attribute__((always_inline))
 simde__m512i evaluate_batch(
     const HandBatch& batch
@@ -293,9 +327,10 @@ simde__m512i evaluate_batch(
         v_rank_counts = simde_mm512_add_epi64(v_rank_counts, v_ranks);
     }
 
-    return evaluate_hands_avx512(v_suit_mask, v_rank_mask, v_rank_counts);
+    return evaluate_hands_avx512<Hand>(v_suit_mask, v_rank_mask, v_rank_counts);
 }
 
+template<Int64Enum Hand>
 std::int64_t evaluate_batches(
     const std::size_t num_hands,
     const HandBatch* batches
@@ -305,12 +340,12 @@ std::int64_t evaluate_batches(
 
     simde__m512i total_score = simde_mm512_setzero_si512();
     for(std::size_t i = 0; i < num_batches; i++) {
-        const simde__m512i batch_score = evaluate_batch(batches[i]);
+        const simde__m512i batch_score = evaluate_batch<Hand>(batches[i]);
         total_score = simde_mm512_add_epi64(total_score, batch_score);
     }
 
     if (num_remainder > 0) {
-        const simde__m512i batch_score = evaluate_batch(batches[num_batches]);
+        const simde__m512i batch_score = evaluate_batch<Hand>(batches[num_batches]);
 
         // Create a bitmask for the valid hands (e.g., a remainder of 3 creates 0b00000111)
         const simde__mmask8 valid_mask = (1 << num_remainder) - 1;
@@ -412,7 +447,7 @@ inline void generate_pulls(const RemainingDeck& deck, Consumer&& cb) {
     } else static_assert(false, "cards_to_pull must be ∈ [0..5]");
 }
 
-template<std::size_t cards_discarded>
+template<Int64Enum Hand, std::size_t cards_discarded>
 std::int64_t score_of_hand_with(const RemainingDeck& deck, const HandBatch& base_batch, const std::array<size_t, 5>& discard_slots) {
     HandBatch current_batch = base_batch;
 
@@ -430,13 +465,13 @@ std::int64_t score_of_hand_with(const RemainingDeck& deck, const HandBatch& base
 
         hand_idx++;
         if (hand_idx == 8) {
-            total_score = simde_mm512_add_epi64(total_score, evaluate_batch(current_batch));
+            total_score = simde_mm512_add_epi64(total_score, evaluate_batch<Hand>(current_batch));
             hand_idx = 0;
         }
     });
 
     if (hand_idx > 0) {
-        const simde__m512i batch_score = evaluate_batch(current_batch);
+        const simde__m512i batch_score = evaluate_batch<Hand>(current_batch);
 
         // Create a bitmask for the valid hands (e.g., a remainder of 3 creates 0b00000111)
         const simde__mmask8 valid_mask = (1 << hand_idx) - 1;
@@ -472,6 +507,7 @@ constexpr std::array<std::array<std::size_t, 5>, 32> DISCARD_SLOTS = ([]() const
     return arr;
 })();
 
+template<Int64Enum Hand>
 constexpr inline ScoreAfterDiscards all_scores_for(const std::uint64_t hand_bits, const std::array<Card, 5>& hand) {
     const std::uint64_t deck_mask = RemainingDeck::all_cards & ~hand_bits;
     const RemainingDeck deck = mask47_to_deck(deck_mask);
@@ -491,22 +527,22 @@ constexpr inline ScoreAfterDiscards all_scores_for(const std::uint64_t hand_bits
 
         switch (num_discarded) {
             case 0:
-                scores[discard_mask] = score_of_hand_with<0>(deck, base_batch, discard_slots);
+                scores[discard_mask] = score_of_hand_with<Hand, 0>(deck, base_batch, discard_slots);
                 break;
             case 1:
-                scores[discard_mask] = score_of_hand_with<1>(deck, base_batch, discard_slots);
+                scores[discard_mask] = score_of_hand_with<Hand, 1>(deck, base_batch, discard_slots);
                 break;
             case 2:
-                scores[discard_mask] = score_of_hand_with<2>(deck, base_batch, discard_slots);
+                scores[discard_mask] = score_of_hand_with<Hand, 2>(deck, base_batch, discard_slots);
                 break;
             case 3:
-                scores[discard_mask] = score_of_hand_with<3>(deck, base_batch, discard_slots);
+                scores[discard_mask] = score_of_hand_with<Hand, 3>(deck, base_batch, discard_slots);
                 break;
             case 4:
-                scores[discard_mask] = score_of_hand_with<4>(deck, base_batch, discard_slots);
+                scores[discard_mask] = score_of_hand_with<Hand, 4>(deck, base_batch, discard_slots);
                 break;
             case 5:
-                scores[discard_mask] = score_of_hand_with<5>(deck, base_batch, discard_slots);
+                scores[discard_mask] = score_of_hand_with<Hand, 5>(deck, base_batch, discard_slots);
                 break;
             default: std::unreachable();
         }
@@ -529,6 +565,143 @@ constexpr std::uint64_t n_choose_k = ([]() constexpr -> std::uint64_t {
     }
     return res;
 })();
+
+constexpr std::uint64_t num_canonical_hands = ([]() constexpr -> std::uint64_t {
+    // Burnside's Lemma tells us how to reduce symmetry in counting groups
+    // For each "actor" on our hands that preserves the structure, we can take "how many ways to apply that actor"
+    // Add those all up and divide by the total number of actors
+
+    // There is one way to have all hands
+    constexpr std::uint64_t identity = n_choose_k<52, 5>;
+
+    // There are six (4 choose 2) ways to swap two suits
+    // If the two suits we choose:
+    // - Have zero cards each in them, then there's 26c5 possibilities for the rest of the cards
+    // - Have one card of the same rank each in them, then there's 13c1 choices for the pair rank and 26c3 choices for the rest of the cards
+    // - Have two cards of the same rank each in them, then there's 13c2 choices for the pair ranks and 26c1 choices for the other card
+    constexpr std::uint64_t single_swap =
+        n_choose_k<26, 5> +
+            (n_choose_k<13, 1> * n_choose_k<26, 3>) +
+                (n_choose_k<13, 2> * n_choose_k<26, 1>);
+
+    // There are three ways to swap two sets of suits
+    // (4 choose 2 (the first pair) * 2 choose 2 (the second pair)) / 2! (permute the pairings) = 6/2 = 3
+    // A hand has exactly 5 cards so there is no way we can do this without changing the meaning of a hand
+    constexpr std::uint64_t double_swap = 0;
+
+    // There are eight (2! * (4 choose 3)) ways to cycle three suits
+    // If the three suits we choose:
+    // - Have zero cards each in them, then there's 13c5 possibilities for the rest of the cards
+    // - Have one card each in them, then there's 13c1 possibilities for the triplet rank, and 13c2 possibilities for the rest of the cards
+    constexpr std::uint64_t three_cycle =
+        n_choose_k<13, 5> +
+            (n_choose_k<13, 1> * n_choose_k<13, 2>);
+
+    // There are six (3! * (4 choose 4)) ways to cycle four suits
+    // A hand has no more than 4 suits so there is no way we can do this without changing the meaning of a hand
+    constexpr std::uint64_t four_cycle = 0;
+
+    constexpr std::uint64_t ops =
+        (1 * identity) +
+            (6 * single_swap) +
+                (3 * double_swap) +
+                    (8 * three_cycle) +
+                        (6 * four_cycle);
+
+    // 4! ways to permute the suits
+    constexpr std::uint64_t suit_permutation_count = 24;
+
+    return ops / suit_permutation_count;
+})();
+
+constexpr std::array<std::array<std::uint64_t, 4>, 24> SUIT_PERMUTATIONS = ([]() constexpr {
+    std::array<std::array<std::uint64_t, 4>, 24> perms{};
+    // we permute the indices of the suits because in get_weight we do math on bit position
+    std::array<std::uint64_t, 4> current = {0, 1, 2, 3};
+    std::size_t idx = 0;
+    do {
+        perms[idx++] = current;
+    } while (std::ranges::next_permutation(current).found);
+    return perms;
+})();
+
+inline std::uint64_t get_weight(const std::uint64_t hand) {
+    std::array<std::uint64_t, 5> card_indices {};
+
+    std::uint64_t temp = hand;
+    for (int i = 0; i < 5; ++i) {
+        // get the lowest bit and clear it
+        card_indices[i] = std::countr_zero(temp);
+        temp &= temp - 1;
+    }
+
+    std::uint64_t unique_masks = 0;
+    std::array<std::uint64_t, 24> seen_masks{};
+
+    for (const auto& perm : SUIT_PERMUTATIONS) {
+        std::uint64_t mapped_hand = 0;
+        for (int i = 0; i < 5; ++i) {
+            // each rank is every 4 bits, meaning the actual rank value is the index rounded down to the nearest 16
+            const int rank_base = card_indices[i] & ~3;
+            // the suit is the remainder of this rounding down
+            const int original_suit = card_indices[i] & 3;
+            const int mapped_suit = perm[original_suit];
+            mapped_hand |= (1ULL << (rank_base + mapped_suit));
+        }
+
+        if (mapped_hand > hand) {
+            // we know that this isn't the canonical hand
+            // so it shouldn't appear in results
+            return 0;
+        }
+
+        // we keep track of all unique masks to discover the weight value
+        bool is_unique = true;
+        for (std::uint64_t u = 0; u < unique_masks; ++u) {
+            if (seen_masks[u] == mapped_hand) {
+                is_unique = false;
+                break;
+            }
+        }
+        // if we haven't seen this permutation before, add it to our filter
+        if (is_unique) {
+            seen_masks[unique_masks++] = mapped_hand;
+        }
+    }
+
+    // this is the canonical hand, so we return how many other hands it has absorbed
+    return unique_masks;
+}
+
+// a hand unique up to suit symmetries
+struct CanonicalHand {
+    std::uint64_t mask;
+    // how many times does this hand "occur"
+    std::uint64_t weight;
+};
+
+std::vector<CanonicalHand> generate_canonical_hands() {
+    std::vector<CanonicalHand> result;
+    result.reserve(num_canonical_hands + 1);
+
+    for (std::uint64_t c1 = 1; c1 < (1ULL << (52 - 4)); c1 <<= 1) {
+        for (std::uint64_t c2 = c1 << 1; c2 < (1ULL << (52 - 3)); c2 <<= 1) {
+            for (std::uint64_t c3 = c2 << 1; c3 < (1ULL << (52 - 2)); c3 <<= 1) {
+                for (std::uint64_t c4 = c3 << 1; c4 < (1ULL << (52 - 1)); c4 <<= 1) {
+                    for (std::uint64_t c5 = c4 << 1; c5 < (1ULL << (52 - 0)); c5 <<= 1) {
+                        const std::uint64_t hand = c1 | c2 | c3 | c4 | c5;
+
+                        const std::uint64_t weight = get_weight(hand);
+                        if (weight != 0) {
+                            result.push_back({hand, weight});
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return result;
+}
 
 constexpr inline std::uint64_t denominator(std::uint64_t mask) {
     switch (std::popcount(mask)) {
@@ -559,6 +732,7 @@ struct HandResult {
     std::uint64_t original_hand;
     std::uint8_t mask;
     std::int64_t score;
+    std::uint64_t weight;
 };
 
 moodycamel::BlockingConcurrentQueue<HandResult> write_queue;
@@ -588,7 +762,7 @@ void background_writer(std::ofstream&& outfile) {
     std::array<HandResult, 2048> buffer;
 
     std::size_t total_written = 0;
-    auto before = std::chrono::steady_clock::now();
+    const auto before = std::chrono::steady_clock::now();
 
     while (true) {
         std::size_t elements_received = 0;
@@ -596,13 +770,21 @@ void background_writer(std::ofstream&& outfile) {
         do {
             elements_received = write_queue.wait_dequeue_bulk_timed(write_queue_consumption, buffer.data(), buffer.size(), std::chrono::milliseconds(4000));
 
-            if (elements_received == 0 && computations_done.load(std::memory_order_acquire)) return;
+            if (elements_received == 0 && computations_done.load(std::memory_order_acquire)) {
+                constexpr std::uint64_t TOTAL_STARTING_HANDS = n_choose_k<52, 5>;
+                constexpr std::uint64_t FINAL_DENOMINATOR = LCM_DENOMINATOR * TOTAL_STARTING_HANDS;
+
+                outfile << std::format("Total EV: {}/{}\n", total_ev_numerator, FINAL_DENOMINATOR) << std::endl;
+
+                return;
+            }
         } while (elements_received == 0);
 
         for (std::size_t i = 0; i < elements_received; i++) {
             const auto& result = buffer[i];
 
-            total_ev_numerator += result.score * SCALARS[result.mask];
+            // the total ev is (our score) * (correction term for LCM) * (number of permutations we ate)
+            total_ev_numerator += result.score * SCALARS[result.mask] * result.weight;
 
             const std::array<Card, 5> cards = mask_to_hand5(result.original_hand);
 
@@ -619,6 +801,10 @@ void background_writer(std::ofstream&& outfile) {
             local_string += REVERSED_BITMASKS[result.mask];
             local_string += " ";
 
+            auto [ptr0, ec0] = std::to_chars(num_buf.data(), num_buf.data() + num_buf.size(), result.weight);
+            local_string.append(num_buf.data(), ptr0 - num_buf.data());
+            local_string += "x ";
+
             auto [ptr1, ec1] = std::to_chars(num_buf.data(), num_buf.data() + num_buf.size(), result.score);
             local_string.append(num_buf.data(), ptr1 - num_buf.data());
 
@@ -634,7 +820,7 @@ void background_writer(std::ofstream&& outfile) {
         local_string.clear();
 
         total_written += elements_received;
-        constexpr std::size_t TOTAL_TO_WRITE = n_choose_k<52, 5>;
+        constexpr std::size_t TOTAL_TO_WRITE = num_canonical_hands;
         double frac = static_cast<double>(total_written) / static_cast<double>(TOTAL_TO_WRITE);
         double pct = frac * 100.0;
         auto now = std::chrono::steady_clock::now();
@@ -646,19 +832,20 @@ void background_writer(std::ofstream&& outfile) {
             std::chrono::duration_cast<std::chrono::seconds>(expected_total_time));
         std::fprintf(stdout, "wrote %zu/%zu items (%.2f%%) [%s]\n", total_written, TOTAL_TO_WRITE, pct, eta_string.c_str());
     }
-
-    constexpr std::uint64_t TOTAL_STARTING_HANDS = n_choose_k<52, 5>;
-    constexpr std::uint64_t FINAL_DENOMINATOR = LCM_DENOMINATOR * TOTAL_STARTING_HANDS;
-
-    outfile << std::format("Total EV: {}/{}\n", total_ev_numerator, FINAL_DENOMINATOR) << std::endl;
 }
 
 int main(int argc, char **argv) {
+    using Hand = PokerHandJacksOrBetter;
+
     if (argc != 1) {
         std::cout << argv[0] << " takes no arguments.\n";
         return 1;
     }
     std::cout << "This is project " << PROJECT_NAME << ".\n";
+
+    fprintf(stdout, "Filtering all hands to uniqueness by suit...\n");
+    const std::vector<CanonicalHand> canonical_hands = generate_canonical_hands();
+    fprintf(stdout, "Found %zu hands (expected %zu)\n", canonical_hands.size(), num_canonical_hands);
 
     std::ofstream outfile("results.txt");
     if (!outfile.is_open()) {
@@ -667,56 +854,44 @@ int main(int argc, char **argv) {
     }
     std::thread writer(background_writer, std::move(outfile));
 
+
     #pragma omp parallel
     {
         moodycamel::ProducerToken write_production(write_queue);
         std::vector<HandResult> buffer;
         buffer.reserve(2048);
 
-        #pragma omp for collapse(2) schedule(dynamic)
-        for (std::uint64_t ci = 0; ci < 48; ci++) {
-            for (std::uint64_t cj = 1 + ci; cj < 49; cj++) {
-                const std::uint64_t c1 = 1ULL << ci;
-                const std::uint64_t c2 = 1ULL << cj;
+        #pragma omp for schedule(dynamic, 64)
+        for (std::size_t i = 0; i < canonical_hands.size(); i++) {
+            const auto& [hand, weight] = canonical_hands[i];
 
-                for (std::uint64_t c3 = c2 << 1; c3 < (1ULL << (52 - 2)); c3 <<= 1) {
-                    for (std::uint64_t c4 = c3 << 1; c4 < (1ULL << (52 - 1)); c4 <<= 1) {
-                        for (std::uint64_t c5 = c4 << 1; c5 < (1ULL << (52 - 0)); c5 <<= 1) {
-                            const std::uint64_t hand = c1 | c2 | c3 | c4 | c5;
-                            const std::array<Card, 5> cards = {
-                                id_to_card(std::countr_zero(c1)), id_to_card(std::countr_zero(c2)),
-                                id_to_card(std::countr_zero(c3)), id_to_card(std::countr_zero(c4)),
-                                id_to_card(std::countr_zero(c5))
-                            };
-                            const ScoreAfterDiscards scores = all_scores_for(hand, cards);
+            const std::array<Card, 5> cards = mask_to_hand5(hand);
+            const ScoreAfterDiscards scores = all_scores_for<Hand>(hand, cards);
 
-                            std::uint64_t best_mask = 0;
-                            std::int64_t best_score = std::numeric_limits<std::int64_t>::min();
-                            std::uint64_t best_denominator = 1;
-                            for (std::size_t i = 0; i <= 0b11111; i++) {
-                                const std::uint64_t current_denom = DENOMINATORS[i];
-                                const std::int64_t other_num = current_denom * best_score;
-                                const std::int64_t current_num = best_denominator * scores[i];
+            std::uint64_t best_mask = 0;
+            std::int64_t best_score = std::numeric_limits<std::int64_t>::min();
+            std::uint64_t best_denominator = 1;
+            for (std::size_t discard_mask = 0; discard_mask <= 0b11111; discard_mask++) {
+                const std::uint64_t current_denom = DENOMINATORS[discard_mask];
+                const std::int64_t other_num = current_denom * best_score;
+                const std::int64_t current_num = best_denominator * scores[discard_mask];
 
-                                if (current_num > other_num) {
-                                    best_mask = i;
-                                    best_score = scores[i];
-                                    best_denominator = current_denom;
-                                }
-                            }
-
-                            buffer.push_back(HandResult {
-                                .original_hand = hand,
-                                .mask = static_cast<uint8_t>(best_mask),
-                                .score = best_score
-                            });
-                            if (buffer.size() >= 2048) {
-                                write_queue.enqueue_bulk(write_production, buffer.begin(), buffer.size());
-                                buffer.clear();
-                            }
-                        }
-                    }
+                if (current_num > other_num) {
+                    best_mask = discard_mask;
+                    best_score = scores[discard_mask];
+                    best_denominator = current_denom;
                 }
+            }
+
+            buffer.push_back(HandResult {
+                .original_hand = hand,
+                .mask = static_cast<uint8_t>(best_mask),
+                .score = best_score,
+                .weight = weight,
+            });
+            if (buffer.size() >= 2048) {
+                write_queue.enqueue_bulk(write_production, buffer.begin(), buffer.size());
+                buffer.clear();
             }
         }
 
