@@ -1,10 +1,21 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <bit>
+#include <charconv>
 #include <chrono>
+#include <concepts>
+#include <condition_variable>
 #include <cstdint>
+#include <cstdio>
+#include <deque>
+#include <format>
 #include <fstream>
 #include <iostream>
+#include <limits>
+#include <numeric>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include <simde/x86/avx512/add.h>
@@ -20,7 +31,11 @@
 #include <simde/x86/avx512/set1.h>
 #include <simde/x86/avx512/slli.h>
 #include <simde/x86/avx512/srlv.h>
+#include <simde/x86/avx512/store.h>
 #include <simde/x86/avx512/sub.h>
+
+#include "./concurrentqueue.h"
+#include "./blockingconcurrentqueue.h"
 
 #define PROJECT_NAME "hand_eval_simd"
 
@@ -41,21 +56,21 @@ enum PokerRank : std::uint64_t {
     KING  = 0x1000000000000
 };
 
-constexpr inline const char* rank_symbol(const PokerRank rank) {
+constexpr inline char rank_symbol(const PokerRank rank) {
     switch (rank) {
-        case ACE: return "a";
-        case TWO: return "2";
-        case THREE: return "3";
-        case FOUR: return "4";
-        case FIVE: return "5";
-        case SIX: return "6";
-        case SEVEN: return "7";
-        case EIGHT: return "8";
-        case NINE: return "9";
-        case TEN: return "0";
-        case JACK: return "j";
-        case QUEEN: return "q";
-        case KING: return "k";
+        case ACE: return 'a';
+        case TWO: return '2';
+        case THREE: return '3';
+        case FOUR: return '4';
+        case FIVE: return '5';
+        case SIX: return '6';
+        case SEVEN: return '7';
+        case EIGHT: return '8';
+        case NINE: return '9';
+        case TEN: return '0';
+        case JACK: return 'j';
+        case QUEEN: return 'q';
+        case KING: return 'k';
         default: std::unreachable();
     }
 }
@@ -68,12 +83,12 @@ enum PokerSuit : std::uint64_t {
     DIAMONDS = 0b1000
 };
 
-constexpr inline const char* suit_symbol(const PokerSuit suit) {
+constexpr inline char suit_symbol(const PokerSuit suit) {
     switch (suit) {
-        case SPADES: return "S";
-        case HEARTS: return "H";
-        case CLUBS: return "C";
-        case DIAMONDS: return "D";
+        case SPADES: return 'S';
+        case HEARTS: return 'H';
+        case CLUBS: return 'C';
+        case DIAMONDS: return 'D';
         default: std::unreachable();
     }
 }
@@ -398,16 +413,8 @@ inline void generate_pulls(const RemainingDeck& deck, Consumer&& cb) {
 }
 
 template<std::size_t cards_discarded>
-std::int64_t score_of_hand_with(const RemainingDeck& deck, const std::array<Card, 5 - cards_discarded> hand_after_discard) {
-    HandBatch current_batch;
-
-    for (std::size_t card_idx = cards_discarded; card_idx < 5; ++card_idx) {
-        const Card& c = hand_after_discard[card_idx - cards_discarded];
-        for (std::size_t hand_idx = 0; hand_idx < 8; hand_idx++) {
-            current_batch.hand(hand_idx).rank(card_idx) = c.rank;
-            current_batch.hand(hand_idx).suit(card_idx) = c.suit;
-        }
-    }
+std::int64_t score_of_hand_with(const RemainingDeck& deck, const HandBatch& base_batch, const std::array<size_t, 5>& discard_slots) {
+    HandBatch current_batch = base_batch;
 
     std::size_t hand_idx = 0;
     simde__m512i total_score = simde_mm512_setzero_si512();
@@ -415,8 +422,10 @@ std::int64_t score_of_hand_with(const RemainingDeck& deck, const std::array<Card
     generate_pulls<cards_discarded>(deck, [&](const auto& pulled_cards) {
         for (std::size_t i = 0; i < cards_discarded; i++) {
             const Card& c = pulled_cards[i];
-            current_batch.hand(hand_idx).rank(i) = c.rank;
-            current_batch.hand(hand_idx).suit(i) = c.suit;
+            const std::size_t slot = discard_slots[i];
+
+            current_batch.hand(hand_idx).rank(slot) = c.rank;
+            current_batch.hand(hand_idx).suit(slot) = c.suit;
         }
 
         hand_idx++;
@@ -442,19 +451,6 @@ std::int64_t score_of_hand_with(const RemainingDeck& deck, const std::array<Card
 // so that's 32 possible discard choices
 using ScoreAfterDiscards = std::array<std::int64_t, 32>;
 
-template <std::size_t num_kept>
-inline std::array<Card, num_kept> get_kept_cards(const std::array<Card, 5>& hand, const std::size_t discard_mask) {
-    std::array<Card, num_kept> kept;
-    std::size_t idx = 0;
-    for (std::size_t i = 0; i < 5; ++i) {
-        // if the bit at position i is 0, the card is kept
-        if ((discard_mask & (1 << i)) == 0) {
-            kept[idx++] = hand[i];
-        }
-    }
-    return kept;
-}
-
 constexpr inline std::array<Card, 5> mask_to_hand5(std::uint64_t mask) {
     std::array<Card, 5> hand;
     hand[0] = id_to_card(std::countr_zero(mask)); mask &= (mask - 1);
@@ -465,34 +461,52 @@ constexpr inline std::array<Card, 5> mask_to_hand5(std::uint64_t mask) {
     return hand;
 }
 
-constexpr inline ScoreAfterDiscards all_scores_for(const std::uint64_t hand_bits) {
-    const std::array<Card, 5> hand = mask_to_hand5(hand_bits);
+constexpr std::array<std::array<std::size_t, 5>, 32> DISCARD_SLOTS = ([]() constexpr {
+    std::array<std::array<std::size_t, 5>, 32> arr{};
+    for (std::size_t mask = 0; mask < 32; ++mask) {
+        std::size_t idx = 0;
+        for (std::size_t i = 0; i < 5; ++i) {
+            if (mask & (1 << i)) arr[mask][idx++] = i;
+        }
+    }
+    return arr;
+})();
+
+constexpr inline ScoreAfterDiscards all_scores_for(const std::uint64_t hand_bits, const std::array<Card, 5>& hand) {
     const std::uint64_t deck_mask = RemainingDeck::all_cards & ~hand_bits;
     const RemainingDeck deck = mask47_to_deck(deck_mask);
 
+    HandBatch base_batch;
+    for (std::size_t i = 0; i < 5; ++i) {
+        simde_mm512_store_si512(base_batch.ranks[i].data(), simde_mm512_set1_epi64(hand[i].rank));
+        simde_mm512_store_si512(base_batch.suits[i].data(), simde_mm512_set1_epi64(hand[i].suit));
+    }
+
     ScoreAfterDiscards scores;
 
-    for (std::size_t discard_mask = 0; discard_mask < 0b11111; discard_mask++) {
+    for (std::size_t discard_mask = 0; discard_mask <= 0b11111; discard_mask++) {
         const std::size_t num_discarded = std::popcount(discard_mask);
+
+        const auto& discard_slots = DISCARD_SLOTS[discard_mask];
 
         switch (num_discarded) {
             case 0:
-                scores[discard_mask] = score_of_hand_with<0>(deck, get_kept_cards<5>(hand, discard_mask));
+                scores[discard_mask] = score_of_hand_with<0>(deck, base_batch, discard_slots);
                 break;
             case 1:
-                scores[discard_mask] = score_of_hand_with<1>(deck, get_kept_cards<4>(hand, discard_mask));
+                scores[discard_mask] = score_of_hand_with<1>(deck, base_batch, discard_slots);
                 break;
             case 2:
-                scores[discard_mask] = score_of_hand_with<2>(deck, get_kept_cards<3>(hand, discard_mask));
+                scores[discard_mask] = score_of_hand_with<2>(deck, base_batch, discard_slots);
                 break;
             case 3:
-                scores[discard_mask] = score_of_hand_with<3>(deck, get_kept_cards<2>(hand, discard_mask));
+                scores[discard_mask] = score_of_hand_with<3>(deck, base_batch, discard_slots);
                 break;
             case 4:
-                scores[discard_mask] = score_of_hand_with<4>(deck, get_kept_cards<1>(hand, discard_mask));
+                scores[discard_mask] = score_of_hand_with<4>(deck, base_batch, discard_slots);
                 break;
             case 5:
-                scores[discard_mask] = score_of_hand_with<5>(deck, get_kept_cards<0>(hand, discard_mask));
+                scores[discard_mask] = score_of_hand_with<5>(deck, base_batch, discard_slots);
                 break;
             default: std::unreachable();
         }
@@ -502,7 +516,7 @@ constexpr inline ScoreAfterDiscards all_scores_for(const std::uint64_t hand_bits
 }
 
 template<std::uint64_t n, std::uint64_t k>
-std::uint64_t n_choose_k = ([]() constexpr -> std::uint64_t {
+constexpr std::uint64_t n_choose_k = ([]() constexpr -> std::uint64_t {
     std::uint64_t kr = k;
 
     if (kr < 0 || kr > n) return 0;
@@ -528,6 +542,95 @@ constexpr inline std::uint64_t denominator(std::uint64_t mask) {
     }
 }
 
+constexpr std::array<const char*, 32> REVERSED_BITMASKS = {
+    "00000", "10000", "01000", "11000", "00100", "10100", "01100", "11100",
+    "00010", "10010", "01010", "11010", "00110", "10110", "01110", "11110",
+    "00001", "10001", "01001", "11001", "00101", "10101", "01101", "11101",
+    "00011", "10011", "01011", "11011", "00111", "10111", "01111", "11111"
+};
+
+constexpr std::array<std::uint64_t, 32> DENOMINATORS = ([]() constexpr -> std::array<std::uint64_t, 32> {
+    std::array<std::uint64_t, 32> arr{};
+    for (int i = 0; i < 32; ++i) arr[i] = denominator(i);
+    return arr;
+})();
+
+struct HandResult {
+    std::uint64_t original_hand;
+    std::uint8_t mask;
+    std::int64_t score;
+};
+
+moodycamel::BlockingConcurrentQueue<HandResult> write_queue;
+std::atomic<bool> computations_done{false};
+
+void background_writer(std::ofstream&& outfile) {
+    moodycamel::ConsumerToken write_queue_consumption(write_queue);
+
+    std::string local_string;
+    local_string.reserve(2048 * 64);
+    std::array<char, std::numeric_limits<std::uint64_t>::digits10> num_buf;
+    std::array<HandResult, 2048> buffer;
+
+    std::size_t total_written = 0;
+    auto before = std::chrono::steady_clock::now();
+
+    while (true) {
+        std::size_t elements_received = 0;
+
+        do {
+            elements_received = write_queue.wait_dequeue_bulk_timed(write_queue_consumption, buffer.data(), buffer.size(), std::chrono::milliseconds(4000));
+
+            if (elements_received == 0 && computations_done.load(std::memory_order_acquire)) return;
+        } while (elements_received == 0);
+
+        for (std::size_t i = 0; i < elements_received; i++) {
+            const auto& result = buffer[i];
+
+            const std::array<Card, 5> cards = mask_to_hand5(result.original_hand);
+
+            std::array<char, 16> hand_string;
+            for (std::size_t ci = 0; ci < 5; ci++) {
+                hand_string[ci * 3] = rank_symbol(cards[ci].rank);
+                hand_string[ci * 3 + 1] = suit_symbol(cards[ci].suit);
+                hand_string[ci * 3 + 2] = (ci != 4) ? ' ' : ':';
+            }
+            hand_string[15] = ' ';
+
+            local_string.append(hand_string.data(), 16);
+
+            local_string += REVERSED_BITMASKS[result.mask];
+            local_string += " ";
+
+            auto [ptr1, ec1] = std::to_chars(num_buf.data(), num_buf.data() + num_buf.size(), result.score);
+            local_string.append(num_buf.data(), ptr1 - num_buf.data());
+
+            local_string += "/";
+
+            auto [ptr2, ec2] = std::to_chars(num_buf.data(), num_buf.data() + num_buf.size(), DENOMINATORS[result.mask]);
+            local_string.append(num_buf.data(), ptr2 - num_buf.data());
+
+            local_string += "\n";
+        }
+
+        outfile << local_string;
+        local_string.clear();
+
+        total_written += elements_received;
+        constexpr std::size_t TOTAL_TO_WRITE = n_choose_k<52, 5>;
+        double frac = static_cast<double>(total_written) / static_cast<double>(TOTAL_TO_WRITE);
+        double pct = frac * 100.0;
+        auto now = std::chrono::steady_clock::now();
+        auto time_taken = now - before;
+        auto expected_total_time = time_taken / frac;
+        std::string eta_string = std::format(
+            "{:%M:%S}/{:%M:%S}",
+            std::chrono::duration_cast<std::chrono::seconds>(time_taken),
+            std::chrono::duration_cast<std::chrono::seconds>(expected_total_time));
+        std::fprintf(stdout, "wrote %zu/%zu items (%.2f%%) [%s]\n", total_written, TOTAL_TO_WRITE, pct, eta_string.c_str());
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc != 1) {
         std::cout << argv[0] << " takes no arguments.\n";
@@ -540,70 +643,91 @@ int main(int argc, char **argv) {
         std::cerr << "Failed to open results.txt\n";
         return 1;
     }
+    std::thread writer(background_writer, std::move(outfile));
 
-    constexpr int total_chunks = (48 * 49) / 2;
-    std::atomic<std::size_t> iterations_complete {0};
+    // we want the total EV of the game to be (sum(individual EVs))/(52 choose 5)
+    constexpr std::uint64_t LCM_DENOMINATOR = ([]() constexpr -> std::uint64_t {
+        return std::accumulate(DENOMINATORS.begin(), DENOMINATORS.end(), 1ULL,
+            [](const std::uint64_t a, const std::uint64_t b) { return std::lcm(a, b); });
+    })();
 
-    #pragma omp parallel for collapse(2) schedule(dynamic)
-    for (std::uint64_t ci = 0; ci < 48; ci++) {
-        for (std::uint64_t cj = 1 + ci; cj < 49; cj++) {
-            const std::uint64_t c1 = 1ULL << ci;
-            const std::uint64_t c2 = 1ULL << cj;
+    // so for each EV, we can calculate what we need to multiply it by to make it the proper numerator
+    constexpr std::array<std::uint64_t, 32> SCALARS = ([]() constexpr -> std::array<std::uint64_t, 32> {
+        std::array<std::uint64_t, 32> arr{};
+        for (int i = 0; i < 32; ++i) arr[i] = LCM_DENOMINATOR / denominator(i);
+        return arr;
+    })();
 
-            std::ostringstream local_buffer;
+    std::int64_t total_ev_numerator = 0;
 
-            for (std::uint64_t c3 = c2 << 1; c3 < (1ULL << (52 - 2)); c3 <<= 1) {
-                for (std::uint64_t c4 = c3 << 1; c4 < (1ULL << (52 - 1)); c4 <<= 1) {
-                    for (std::uint64_t c5 = c4 << 1; c5 < (1ULL << (52 - 0)); c5 <<= 1) {
-                        auto before = std::chrono::system_clock::now();
+    #pragma omp parallel
+    {
+        moodycamel::ProducerToken write_production(write_queue);
+        std::vector<HandResult> buffer;
+        buffer.reserve(2048);
 
-                        const std::uint64_t hand = c1 | c2 | c3 | c4 | c5;
-                        const ScoreAfterDiscards scores = all_scores_for(hand);
+        #pragma omp for collapse(2) schedule(dynamic) reduction(+:total_ev_numerator)
+        for (std::uint64_t ci = 0; ci < 48; ci++) {
+            for (std::uint64_t cj = 1 + ci; cj < 49; cj++) {
+                const std::uint64_t c1 = 1ULL << ci;
+                const std::uint64_t c2 = 1ULL << cj;
 
-                        std::uint64_t best_mask = 0;
-                        std::int64_t best_score = std::numeric_limits<std::int64_t>::min();
-                        std::uint64_t best_denominator = 1;
-                        for (std::size_t i = 0; i < 0b11111; i++) {
-                            const std::uint64_t current_denom = denominator(i);
-                            const std::int64_t other_num = current_denom * best_score;
-                            const std::int64_t current_num = best_denominator * scores[i];
+                for (std::uint64_t c3 = c2 << 1; c3 < (1ULL << (52 - 2)); c3 <<= 1) {
+                    for (std::uint64_t c4 = c3 << 1; c4 < (1ULL << (52 - 1)); c4 <<= 1) {
+                        for (std::uint64_t c5 = c4 << 1; c5 < (1ULL << (52 - 0)); c5 <<= 1) {
+                            const std::uint64_t hand = c1 | c2 | c3 | c4 | c5;
+                            const std::array<Card, 5> cards = {
+                                id_to_card(std::countr_zero(c1)), id_to_card(std::countr_zero(c2)),
+                                id_to_card(std::countr_zero(c3)), id_to_card(std::countr_zero(c4)),
+                                id_to_card(std::countr_zero(c5))
+                            };
+                            const ScoreAfterDiscards scores = all_scores_for(hand, cards);
 
-                            if (current_num > other_num) {
-                                best_mask = i;
-                                best_score = scores[i];
-                                best_denominator = current_denom;
+                            std::uint64_t best_mask = 0;
+                            std::int64_t best_score = std::numeric_limits<std::int64_t>::min();
+                            std::uint64_t best_denominator = 1;
+                            for (std::size_t i = 0; i <= 0b11111; i++) {
+                                const std::uint64_t current_denom = DENOMINATORS[i];
+                                const std::int64_t other_num = current_denom * best_score;
+                                const std::int64_t current_num = best_denominator * scores[i];
+
+                                if (current_num > other_num) {
+                                    best_mask = i;
+                                    best_score = scores[i];
+                                    best_denominator = current_denom;
+                                }
+                            }
+
+                            total_ev_numerator += best_score * SCALARS[best_mask];
+
+                            buffer.push_back(HandResult {
+                                .original_hand = hand,
+                                .mask = static_cast<uint8_t>(best_mask),
+                                .score = best_score
+                            });
+                            if (buffer.size() >= 2048) {
+                                write_queue.enqueue_bulk(write_production, buffer.begin(), buffer.size());
+                                buffer.clear();
                             }
                         }
-
-                        auto after = std::chrono::system_clock::now();
-
-                        std::array<Card, 5> cards = mask_to_hand5(hand);
-                        for (std::size_t i = 0; i < 5; i++) {
-                            const char* rank = rank_symbol(cards[i].rank);
-                            const char* suit = suit_symbol(cards[i].suit);
-
-                            local_buffer << rank << suit;
-                            if (i != 4) local_buffer << " ";
-                            else local_buffer << ": ";
-                        }
-
-                        std::string bit_mask_text = std::format("{:0>5b}", best_mask);
-                        std::ranges::reverse(bit_mask_text);
-                        local_buffer << bit_mask_text << " " << best_score << "/" << best_denominator << ", ";
-                        local_buffer << std::chrono::duration<double, std::milli>(after - before).count() << "\n";
                     }
                 }
             }
+        }
 
-            const std::size_t current_progress = ++iterations_complete;
-            #pragma omp critical
-            {
-                outfile << local_buffer.str();
-
-                std::cout << "iteration " << current_progress << "/" << total_chunks << " complete" << std::endl;
-            }
+        if (!buffer.empty()) {
+            write_queue.enqueue_bulk(write_production, buffer.begin(), buffer.size());
+            buffer.clear();
         }
     }
+
+    constexpr std::uint64_t TOTAL_STARTING_HANDS = n_choose_k<52, 5>;
+    constexpr std::uint64_t FINAL_DENOMINATOR = LCM_DENOMINATOR * TOTAL_STARTING_HANDS;
+
+    std::fprintf(stdout, "Total EV: %lld/%llu\n", total_ev_numerator, FINAL_DENOMINATOR);
+    computations_done.store(true, std::memory_order::release);
+
+    writer.join();
 
     return 0;
 }
