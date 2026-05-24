@@ -21,6 +21,10 @@ possible “replaced hands” given an incomplete hand. I figured this would be 
 built in the first place. Streaming hands directly into evaluation dropped the per-hand runtime down to 2ms, taking the
 total time to build all results from multiple days to only a few minutes.
 
+Finally, a single-threaded preprocessing routine can bring the number of hands to process down from 2,598,960 to only
+134,459 (a 95% reduction in search space) bringing the runtime of the total program from ~30mins on my desktop to only
+1m30s.
+
 Iʼve published the code mostly for my own future reference, when I encounter a problem in the future that requires use
 of SIMD.
 
