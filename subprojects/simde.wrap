@@ -1,0 +1,6 @@
+[wrap-git]
+url = https://github.com/simd-everywhere/simde.git
+revision = f3e8262173b7089db9a9d57a9ecef8dd07ad9c97
+
+[provide]
+dependency_names = simde
