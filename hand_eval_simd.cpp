@@ -567,6 +567,21 @@ std::atomic<bool> computations_done{false};
 void background_writer(std::ofstream&& outfile) {
     moodycamel::ConsumerToken write_queue_consumption(write_queue);
 
+    // we want the total EV of the game to be (sum(individual EVs))/(52 choose 5)
+    constexpr std::uint64_t LCM_DENOMINATOR = ([]() constexpr -> std::uint64_t {
+        return std::accumulate(DENOMINATORS.begin(), DENOMINATORS.end(), 1ULL,
+            [](const std::uint64_t a, const std::uint64_t b) { return std::lcm(a, b); });
+    })();
+
+    // so for each EV, we can calculate what we need to multiply it by to make it the proper numerator
+    constexpr std::array<std::uint64_t, 32> SCALARS = ([]() constexpr -> std::array<std::uint64_t, 32> {
+        std::array<std::uint64_t, 32> arr{};
+        for (int i = 0; i < 32; ++i) arr[i] = LCM_DENOMINATOR / denominator(i);
+        return arr;
+    })();
+
+    std::int64_t total_ev_numerator = 0;
+
     std::string local_string;
     local_string.reserve(2048 * 64);
     std::array<char, std::numeric_limits<std::uint64_t>::digits10> num_buf;
@@ -586,6 +601,8 @@ void background_writer(std::ofstream&& outfile) {
 
         for (std::size_t i = 0; i < elements_received; i++) {
             const auto& result = buffer[i];
+
+            total_ev_numerator += result.score * SCALARS[result.mask];
 
             const std::array<Card, 5> cards = mask_to_hand5(result.original_hand);
 
@@ -629,6 +646,11 @@ void background_writer(std::ofstream&& outfile) {
             std::chrono::duration_cast<std::chrono::seconds>(expected_total_time));
         std::fprintf(stdout, "wrote %zu/%zu items (%.2f%%) [%s]\n", total_written, TOTAL_TO_WRITE, pct, eta_string.c_str());
     }
+
+    constexpr std::uint64_t TOTAL_STARTING_HANDS = n_choose_k<52, 5>;
+    constexpr std::uint64_t FINAL_DENOMINATOR = LCM_DENOMINATOR * TOTAL_STARTING_HANDS;
+
+    outfile << std::format("Total EV: {}/{}\n", total_ev_numerator, FINAL_DENOMINATOR) << std::endl;
 }
 
 int main(int argc, char **argv) {
@@ -645,28 +667,13 @@ int main(int argc, char **argv) {
     }
     std::thread writer(background_writer, std::move(outfile));
 
-    // we want the total EV of the game to be (sum(individual EVs))/(52 choose 5)
-    constexpr std::uint64_t LCM_DENOMINATOR = ([]() constexpr -> std::uint64_t {
-        return std::accumulate(DENOMINATORS.begin(), DENOMINATORS.end(), 1ULL,
-            [](const std::uint64_t a, const std::uint64_t b) { return std::lcm(a, b); });
-    })();
-
-    // so for each EV, we can calculate what we need to multiply it by to make it the proper numerator
-    constexpr std::array<std::uint64_t, 32> SCALARS = ([]() constexpr -> std::array<std::uint64_t, 32> {
-        std::array<std::uint64_t, 32> arr{};
-        for (int i = 0; i < 32; ++i) arr[i] = LCM_DENOMINATOR / denominator(i);
-        return arr;
-    })();
-
-    std::int64_t total_ev_numerator = 0;
-
     #pragma omp parallel
     {
         moodycamel::ProducerToken write_production(write_queue);
         std::vector<HandResult> buffer;
         buffer.reserve(2048);
 
-        #pragma omp for collapse(2) schedule(dynamic) reduction(+:total_ev_numerator)
+        #pragma omp for collapse(2) schedule(dynamic)
         for (std::uint64_t ci = 0; ci < 48; ci++) {
             for (std::uint64_t cj = 1 + ci; cj < 49; cj++) {
                 const std::uint64_t c1 = 1ULL << ci;
@@ -698,8 +705,6 @@ int main(int argc, char **argv) {
                                 }
                             }
 
-                            total_ev_numerator += best_score * SCALARS[best_mask];
-
                             buffer.push_back(HandResult {
                                 .original_hand = hand,
                                 .mask = static_cast<uint8_t>(best_mask),
@@ -721,10 +726,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    constexpr std::uint64_t TOTAL_STARTING_HANDS = n_choose_k<52, 5>;
-    constexpr std::uint64_t FINAL_DENOMINATOR = LCM_DENOMINATOR * TOTAL_STARTING_HANDS;
-
-    std::fprintf(stdout, "Total EV: %lld/%llu\n", total_ev_numerator, FINAL_DENOMINATOR);
     computations_done.store(true, std::memory_order::release);
 
     writer.join();
