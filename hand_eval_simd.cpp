@@ -595,11 +595,12 @@ int main(int argc, char **argv) {
                 }
             }
 
+            const std::size_t current_progress = ++iterations_complete;
             #pragma omp critical
             {
                 outfile << local_buffer.str();
-                ++iterations_complete;
-                std::cout << "iteration " << iterations_complete << "/" << total_chunks << " complete" << std::endl;
+
+                std::cout << "iteration " << current_progress << "/" << total_chunks << " complete" << std::endl;
             }
         }
     }
